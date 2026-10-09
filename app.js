@@ -2,7 +2,7 @@
    Žádné cizí knihovny: přihlášení OAuth 2.0 + PKCE (osobní Microsoft účty), Microsoft Graph přes fetch. */
 "use strict";
 
-const VERSION = "1.1.0";
+const VERSION = "1.3.0";
 const CFG = window.CRM_CONFIG || {};
 const AUTH = "https://login.microsoftonline.com/consumers/oauth2/v2.0";
 const GRAPH = "https://graph.microsoft.com/v1.0";
@@ -16,7 +16,12 @@ const ls = {
   set(k, v) { try { localStorage.setItem("crm." + k, JSON.stringify(v)); } catch { /* plné nebo zakázané */ } },
   del(k) { try { localStorage.removeItem("crm." + k); } catch { /* */ } },
 };
-const settings = () => ({ folder: ls.get("folder", CFG.defaultFolder || "CRM mobil"), shrink: ls.get("shrink", true) });
+// fotky: rozlišení „orig“ (výchozí) nebo „2560“; komprese 0–60 % → kvalita JPEG = 100 − komprese; 0 % = beze změny
+const settings = () => ({
+  folder: ls.get("folder", CFG.defaultFolder || "CRM mobil"),
+  resize: ls.get("resize", "orig"),
+  compress: Math.max(0, Math.min(60, Number(ls.get("compress", 35)) || 0)),
+});
 
 const $ = (id) => document.getElementById(id);
 function toast(text, ms = 2600, actionLabel = "", action = null) {
@@ -240,17 +245,23 @@ function slug(text, fallback) {
 
 // ---------------------------------------------------------------- fotky
 async function shrinkPhoto(file) {
-  if (!settings().shrink || !/^image\/(jpeg|png|webp)$/i.test(file.type)) return { blob: file, ext: extOf(file) };
+  const { resize, compress } = settings();
+  const original = { blob: file, ext: extOf(file) };
+  if ((compress === 0 && resize === "orig") || !/^image\/(jpeg|png|webp)$/i.test(file.type)) return original;
   try {
     const bmp = await createImageBitmap(file, { imageOrientation: "from-image" });
-    const scale = Math.min(1, MAX_PX / Math.max(bmp.width, bmp.height));
-    if (scale === 1 && file.type === "image/jpeg") return { blob: file, ext: ".jpg" };
+    const scale = resize === "2560" ? Math.min(1, MAX_PX / Math.max(bmp.width, bmp.height)) : 1;
     const c = document.createElement("canvas");
     c.width = Math.round(bmp.width * scale); c.height = Math.round(bmp.height * scale);
     c.getContext("2d").drawImage(bmp, 0, 0, c.width, c.height);
-    const blob = await new Promise((r) => c.toBlob(r, "image/jpeg", 0.85));
-    return blob ? { blob, ext: ".jpg" } : { blob: file, ext: extOf(file) };
-  } catch { return { blob: file, ext: extOf(file) }; }
+    if (bmp.close) bmp.close();
+    const quality = compress === 0 ? 0.95 : (100 - compress) / 100;
+    const blob = await new Promise((r) => c.toBlob(r, "image/jpeg", quality));
+    c.width = c.height = 0;                                   // uvolnit paměť (velké fotky)
+    // když by „zmenšená“ fotka vyšla větší než originál, pošleme originál
+    if (!blob || (scale === 1 && blob.size >= file.size)) return original;
+    return { blob, ext: ".jpg" };
+  } catch { return original; }                                // obří snímek, nepodporovaný formát… → originál
 }
 function extOf(file) {
   const m = /\.[a-z0-9]{2,5}$/i.exec(file.name || ""); if (m) return m[0].toLowerCase();
@@ -386,7 +397,7 @@ function insertAtCursor(text) {
 // Proto posloucháme po jednotlivých promluvách (continuous = false) a po každé hned znovu spustíme.
 // V rámci promluvy vložíme jen ten kus textu, který tam ještě není; opakování po restartu zahodíme.
 const norm = (t) => t.toLocaleLowerCase("cs").replace(/\s+/g, " ").trim();
-let session = { inserted: "" };          // co už se v aktuální promluvě vložilo
+let session = { inserted: "", heard: false, startedAt: 0 };   // co už se v aktuální promluvě vložilo
 let lastFinal = { text: "", at: 0 };     // poslední vložená promluva (ochrana proti opakování po restartu)
 let restartTimer = null;
 
@@ -398,8 +409,8 @@ function commitFinal(text) {
   if (done) {
     if (n === done || done.startsWith(n)) return;                       // nic nového
     if (n.startsWith(done)) add = t.slice(session.inserted.trim().length).trim();
-  } else if (n === norm(lastFinal.text) && Date.now() - lastFinal.at < 4000) {
-    return;                                                             // stejná věta znovu hned po restartu
+  } else if (n === norm(lastFinal.text) && !session.heard && Date.now() - session.startedAt < 1500) {
+    return;   // stejná věta doručená hned po restartu, dřív než jsi začal mluvit = chyba telefonu, ne opakování
   }
   if (!add) return;
   insertAtCursor(add);
@@ -410,13 +421,13 @@ function commitFinal(text) {
 function startSession() {
   rec = new Rec();
   rec.lang = "cs-CZ"; rec.continuous = false; rec.interimResults = true; rec.maxAlternatives = 1;
-  session = { inserted: "" };
+  session = { inserted: "", heard: false, startedAt: Date.now() };
   rec.onresult = (ev) => {
     // jen poslední výsledek – na Androidu obsahuje celou dosavadní promluvu
     const r = ev.results[ev.results.length - 1];
     const text = r[0].transcript;
     if (r.isFinal) { commitFinal(text); $("interim").textContent = ""; }
-    else $("interim").textContent = text;
+    else { session.heard = true; $("interim").textContent = text; }
   };
   rec.onerror = (ev) => {
     if (ev.error === "not-allowed" || ev.error === "service-not-allowed") {
@@ -563,11 +574,17 @@ function renderQueuedBadges() { if (!$("view-list").hidden) renderList(); }
 function updateRelogin() { $("relogin").hidden = !needRelogin; }
 function updateOnline() { $("chip-offline").hidden = navigator.onLine; }
 
+function showCompress() {
+  const v = Number($("set-compress").value);
+  $("compress-value").textContent = v === 0 ? "0 % – fotka se pošle beze změny" : `${v} % (kvalita JPEG ${100 - v})`;
+}
 function openSettings() {
   $("set-user").textContent = ls.get("user") || "—";
   $("set-version").textContent = VERSION;
   $("set-folder").value = settings().folder;
-  $("set-shrink").checked = settings().shrink;
+  $("set-resize").value = settings().resize;
+  $("set-compress").value = settings().compress;
+  showCompress();
   $("clear-confirm").hidden = true;
   refreshQueueChip();
   history.pushState({ view: "settings" }, "");
@@ -601,7 +618,8 @@ async function start() {
   $("btn-inbox").onclick = refreshInbox;
   $("btn-logout").onclick = logout;
   $("set-folder").onchange = () => { ls.set("folder", $("set-folder").value.trim() || CFG.defaultFolder || "CRM mobil"); ls.del("index"); };
-  $("set-shrink").onchange = () => ls.set("shrink", $("set-shrink").checked);
+  $("set-resize").onchange = () => ls.set("resize", $("set-resize").value);
+  $("set-compress").oninput = () => { ls.set("compress", Number($("set-compress").value)); showCompress(); };
   $("btn-flush").onclick = () => { lastError = ""; flushQueue(); };
   $("btn-clear").onclick = () => ($("clear-confirm").hidden = false);
   $("btn-clear-no").onclick = () => ($("clear-confirm").hidden = true);

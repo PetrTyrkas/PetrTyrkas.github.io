@@ -1,5 +1,5 @@
 // Offline běh aplikace: soubory aplikace z mezipaměti, OneDrive a přihlášení vždy ze sítě.
-const CACHE = "crm-mobil-1.1.0";
+const CACHE = "crm-mobil-1.3.0";
 const SHELL = ["./", "index.html", "app.js", "config.js", "manifest.webmanifest", "icons/icon-192.png", "icons/icon-512.png"];
 
 self.addEventListener("install", (e) => {
@@ -14,8 +14,9 @@ self.addEventListener("fetch", (e) => {
   if (e.request.method !== "GET" || url.origin !== location.origin) return;     // Graph, přihlášení → síť
   // nejdřív síť (aby se nová verze projevila hned), bez signálu mezipaměť
   e.respondWith(
-    fetch(e.request).then((res) => {
-      if (res.ok && !url.search) { const copy = res.clone(); caches.open(CACHE).then((c) => c.put(e.request, copy)); }
+    // „no-cache“ = vždy se zeptat serveru na novější verzi (GitHub Pages jinak drží soubory 10 minut)
+    fetch(e.request, { cache: "no-cache" }).then((res) => {
+      if (res.ok) { const copy = res.clone(); caches.open(CACHE).then((c) => c.put(e.request, copy)); }
       return res;
     }).catch(() => caches.match(e.request, { ignoreSearch: true }).then((r) => r || caches.match("index.html")))
   );
