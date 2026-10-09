@@ -2,7 +2,7 @@
    Žádné cizí knihovny: přihlášení OAuth 2.0 + PKCE (osobní Microsoft účty), Microsoft Graph přes fetch. */
 "use strict";
 
-const VERSION = "1.0.0";
+const VERSION = "1.1.0";
 const CFG = window.CRM_CONFIG || {};
 const AUTH = "https://login.microsoftonline.com/consumers/oauth2/v2.0";
 const GRAPH = "https://graph.microsoft.com/v1.0";
@@ -19,8 +19,14 @@ const ls = {
 const settings = () => ({ folder: ls.get("folder", CFG.defaultFolder || "CRM mobil"), shrink: ls.get("shrink", true) });
 
 const $ = (id) => document.getElementById(id);
-function toast(text, ms = 2600) {
+function toast(text, ms = 2600, actionLabel = "", action = null) {
   const t = $("toast"); t.textContent = text; t.hidden = false;
+  if (actionLabel && action) {
+    const btn = document.createElement("button");
+    btn.className = "toast-action"; btn.textContent = actionLabel;
+    btn.onclick = () => { action(); t.hidden = true; };
+    t.appendChild(btn);
+  }
   clearTimeout(toast._t); toast._t = setTimeout(() => (t.hidden = true), ms);
 }
 function esc(s) { return String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c])); }
@@ -252,7 +258,7 @@ function extOf(file) {
 }
 
 const thumbs = new Map();    // jméno souboru → {url, sent}
-async function addPhotos(files) {
+async function addPhotos(files, quiet = false) {
   if (!current || !files.length) return;
   const label = $("photo-label").value.trim();
   for (const file of files) {
@@ -262,8 +268,75 @@ async function addPhotos(files) {
     thumbs.set(name, { url: URL.createObjectURL(blob), sent: false, rid: current.id });
   }
   renderThumbs();
-  toast(files.length === 1 ? "Fotka je ve frontě k odeslání" : `${files.length} fotek ve frontě k odeslání`);
+  if (!quiet) toast(files.length === 1 ? "Fotka je ve frontě k odeslání" : `${files.length} fotek ve frontě k odeslání`);
   flushQueue();
+}
+
+// ---------------------------------------------------------------- série fotek (fotoaparát v aplikaci)
+let cam = { stream: null, capture: null, count: 0, torch: false, busy: false };
+const camOpen = () => !$("cam").hidden;
+
+async function openSeries() {
+  if (!current) return;
+  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+    toast("Fotoaparát v aplikaci tady nejde – použij „Fotka“.", 4000); return;
+  }
+  try {
+    cam.stream = await navigator.mediaDevices.getUserMedia({
+      audio: false, video: { facingMode: { ideal: "environment" }, width: { ideal: 4096 }, height: { ideal: 3072 } },
+    });
+  } catch (e) {
+    toast(e.name === "NotAllowedError" ? "Aplikace nemá povolený fotoaparát – povol ho v nastavení telefonu."
+      : "Fotoaparát nejde spustit: " + e.message, 5000);
+    return;
+  }
+  const track = cam.stream.getVideoTracks()[0];
+  cam.capture = "ImageCapture" in window ? new ImageCapture(track) : null;
+  const caps = track.getCapabilities ? track.getCapabilities() : {};
+  $("cam-torch").hidden = !caps.torch;
+  cam.torch = false; $("cam-torch").setAttribute("aria-pressed", "false");
+  cam.count = 0; updateCamCount();
+  $("cam-video").srcObject = cam.stream;
+  $("cam").hidden = false;
+  history.pushState({ view: "cam" }, "");
+}
+function closeSeries() {
+  if (cam.stream) cam.stream.getTracks().forEach((t) => t.stop());
+  cam = { stream: null, capture: null, count: cam.count, torch: false, busy: false };
+  $("cam-video").srcObject = null;
+  $("cam").hidden = true;
+  if (cam.count) toast(`${cam.count} ${cam.count === 1 ? "fotka" : cam.count < 5 ? "fotky" : "fotek"} ve frontě k odeslání`);
+}
+function updateCamCount() {
+  $("cam-count").textContent = `${cam.count} ${cam.count === 1 ? "fotka" : cam.count >= 2 && cam.count <= 4 ? "fotky" : "fotek"}`;
+}
+async function shoot() {
+  if (!cam.stream || cam.busy) return;
+  cam.busy = true; $("cam-shutter").disabled = true;
+  const f = $("cam-flash"); f.classList.remove("on"); void f.offsetWidth; f.classList.add("on");
+  if (navigator.vibrate) navigator.vibrate(25);
+  try {
+    let blob = null;
+    if (cam.capture) {
+      try { blob = await cam.capture.takePhoto(); } catch { blob = null; }      // plné rozlišení snímače
+      if (cam.torch) setTorch(true);                                            // některé telefony světlo po snímku vypnou
+    }
+    if (!blob) {                                                                // záloha: snímek z náhledu
+      const v = $("cam-video"), c = document.createElement("canvas");
+      c.width = v.videoWidth; c.height = v.videoHeight;
+      c.getContext("2d").drawImage(v, 0, 0);
+      blob = await new Promise((r) => c.toBlob(r, "image/jpeg", 0.92));
+    }
+    if (blob && cam.stream) { cam.count++; updateCamCount(); await addPhotos([blob], true); }
+  } catch (e) { toast("Fotka se nepovedla: " + e.message); }
+  finally { cam.busy = false; $("cam-shutter").disabled = false; }
+}
+async function setTorch(on) {
+  const track = cam.stream && cam.stream.getVideoTracks()[0];
+  if (!track) return;
+  try { await track.applyConstraints({ advanced: [{ torch: on }] }); cam.torch = on; }
+  catch { cam.torch = false; }
+  $("cam-torch").setAttribute("aria-pressed", String(cam.torch));
 }
 function markSent(item) {
   const t = thumbs.get(item.name); if (t) t.sent = true;
@@ -309,33 +382,80 @@ function insertAtCursor(text) {
   saveDraft();
 }
 
-function toggleMic() {
-  if (!Rec) { toast("Tento prohlížeč neumí diktát – použij mikrofon na klávesnici.", 4000); return; }
-  if (listening) { stopMic(); return; }
-  rec = new Rec(); rec.lang = "cs-CZ"; rec.continuous = true; rec.interimResults = true;
+// Chrome na Androidu v režimu „continuous“ posílá už hotové věty znovu (kontejner kontejner kontejner…).
+// Proto posloucháme po jednotlivých promluvách (continuous = false) a po každé hned znovu spustíme.
+// V rámci promluvy vložíme jen ten kus textu, který tam ještě není; opakování po restartu zahodíme.
+const norm = (t) => t.toLocaleLowerCase("cs").replace(/\s+/g, " ").trim();
+let session = { inserted: "" };          // co už se v aktuální promluvě vložilo
+let lastFinal = { text: "", at: 0 };     // poslední vložená promluva (ochrana proti opakování po restartu)
+let restartTimer = null;
+
+function commitFinal(text) {
+  const t = text.trim();
+  if (!t) return;
+  const n = norm(t), done = norm(session.inserted);
+  let add = t;
+  if (done) {
+    if (n === done || done.startsWith(n)) return;                       // nic nového
+    if (n.startsWith(done)) add = t.slice(session.inserted.trim().length).trim();
+  } else if (n === norm(lastFinal.text) && Date.now() - lastFinal.at < 4000) {
+    return;                                                             // stejná věta znovu hned po restartu
+  }
+  if (!add) return;
+  insertAtCursor(add);
+  session.inserted = t.length > session.inserted.length ? t : session.inserted;
+  lastFinal = { text: t, at: Date.now() };
+}
+
+function startSession() {
+  rec = new Rec();
+  rec.lang = "cs-CZ"; rec.continuous = false; rec.interimResults = true; rec.maxAlternatives = 1;
+  session = { inserted: "" };
   rec.onresult = (ev) => {
-    let interim = "";
-    for (let i = ev.resultIndex; i < ev.results.length; i++) {
-      const r = ev.results[i];
-      if (r.isFinal) insertAtCursor(r[0].transcript); else interim += r[0].transcript;
-    }
-    $("interim").textContent = interim;
+    // jen poslední výsledek – na Androidu obsahuje celou dosavadní promluvu
+    const r = ev.results[ev.results.length - 1];
+    const text = r[0].transcript;
+    if (r.isFinal) { commitFinal(text); $("interim").textContent = ""; }
+    else $("interim").textContent = text;
   };
   rec.onerror = (ev) => {
     if (ev.error === "not-allowed" || ev.error === "service-not-allowed") {
       toast("Aplikace nemá povolený mikrofon – povol ho v nastavení telefonu.", 5000); stopMic();
     } else if (ev.error === "network") { toast("Diktát potřebuje připojení k internetu.", 4000); stopMic(); }
+    // „no-speech“ a „aborted“ nevadí – onend poslech znovu spustí
   };
-  rec.onend = () => { if (listening) { try { rec.start(); } catch { stopMic(); } } };   // Android končí po chvíli ticha
+  rec.onend = () => {
+    $("interim").textContent = "";
+    if (!listening) return;
+    clearTimeout(restartTimer);
+    restartTimer = setTimeout(() => { if (listening) { try { startSession(); } catch { stopMic(); } } }, 250);
+  };
+  rec.start();
+}
+
+function toggleMic() {
+  if (!Rec) { toast("Tento prohlížeč neumí diktát – použij mikrofon na klávesnici.", 4000); return; }
+  if (listening) { stopMic(); return; }
   listening = true;
-  try { rec.start(); } catch { listening = false; return; }
+  try { startSession(); } catch { listening = false; return; }
   const b = $("btn-mic"); b.classList.add("rec"); b.innerHTML = '<span class="recdot"></span> Poslouchám – zastavit';
 }
 function stopMic() {
   listening = false;
+  clearTimeout(restartTimer);
   try { rec && rec.stop(); } catch { /* */ }
   $("interim").textContent = "";
   const b = $("btn-mic"); b.classList.remove("rec"); b.textContent = "🎤 Diktovat";
+}
+
+// smazání celého textu s možností vrátit
+function clearDictation() {
+  const ta = $("dictation");
+  if (!ta.value.trim()) return;
+  if (listening) stopMic();
+  const backup = ta.value;
+  ta.value = ""; saveDraft();
+  toast("Text smazán", 6000, "Vrátit", () => { ta.value = backup; saveDraft(); });
 }
 
 const draftKey = () => current ? `draft.${current.id}.${$("section").value}` : "";
@@ -470,6 +590,11 @@ async function start() {
   $("in-camera").onchange = (ev) => { addPhotos([...ev.target.files]); ev.target.value = ""; };
   $("in-gallery").onchange = (ev) => { addPhotos([...ev.target.files]); ev.target.value = ""; };
   $("btn-mic").onclick = toggleMic;
+  $("btn-clear-text").onclick = clearDictation;
+  $("btn-series").onclick = openSeries;
+  $("cam-shutter").onclick = shoot;
+  $("cam-done").onclick = () => history.back();
+  $("cam-torch").onclick = () => setTorch(!cam.torch);
   $("btn-send-text").onclick = sendText;
   $("dictation").oninput = saveDraft;
   $("section").onchange = () => { if (current) ls.set("section." + current.druh, $("section").value); loadDraft(); };
@@ -485,11 +610,15 @@ async function start() {
   window.addEventListener("online", () => { updateOnline(); flushQueue(); refreshIndex(true); });
   window.addEventListener("offline", updateOnline);
   window.addEventListener("popstate", (ev) => {
+    if (camOpen()) { closeSeries(); if (current) { show("rev"); return; } }
     if (listening) stopMic();
     if (ev.state && ev.state.view === "rev" && current) { show("rev"); return; }   // zpět z Nastavení do revize
     current = null; show(signedIn() ? "list" : "login"); renderList();
   });
-  document.addEventListener("visibilitychange", () => { if (document.visibilityState === "visible") flushQueue(); });
+  document.addEventListener("visibilitychange", () => {
+    if (document.visibilityState === "visible") flushQueue();
+    else if (camOpen()) history.back();                 // aplikace na pozadí → uvolnit fotoaparát
+  });
   setInterval(flushQueue, 30000);
 
   if (!signedIn()) { show("login"); return; }

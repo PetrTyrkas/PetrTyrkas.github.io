@@ -1,5 +1,5 @@
 // Offline běh aplikace: soubory aplikace z mezipaměti, OneDrive a přihlášení vždy ze sítě.
-const CACHE = "crm-mobil-1.0.0";
+const CACHE = "crm-mobil-1.1.0";
 const SHELL = ["./", "index.html", "app.js", "config.js", "manifest.webmanifest", "icons/icon-192.png", "icons/icon-512.png"];
 
 self.addEventListener("install", (e) => {
